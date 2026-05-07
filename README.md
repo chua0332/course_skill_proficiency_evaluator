@@ -1,0 +1,1 @@
+This is repository contains the scripts to evaluate course skill with the 3 proficiency labelling - aka 'Basic', 'Intermediate', 'Advanced'. In this case, we are feeding the chatGPT with some localized context for it to do its labelling.
