@@ -7,6 +7,7 @@ import logging
 from dotenv import load_dotenv
 from datetime import datetime
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------------------------------------------------------------------
 # ENVIRONMENT & API SETUP
@@ -25,13 +26,14 @@ client = openai.OpenAI(api_key=OPENAI_API_KEY)
 # ---------------------------------------------------------------------------
 
 MODEL_NAME          = "gpt-4.1"
-INPUT_CSV_PATH      = "./data/extracted_jobs_skills_dataset.csv"
-OUTPUT_CSV_PATH     = "./data/jobpostings_skills_with_proficiency_labels.csv"
-SAVE_EVERY          = 200        # save the output CSV every 200 rows
+INPUT_CSV_PATH      = "./data/extracted_jobs_skills_dataset_modified_algo.csv"
+OUTPUT_CSV_PATH     = "./data/jobpostings_skills_with_proficiency_labels_modified_algo.csv"
+SAVE_EVERY          = 200        # save the output CSV every 200 completed rows
 MAX_RETRIES         = 4
 RETRY_DELAY_SECONDS = 5
 TEMPERATURE         = 0.0
 MAX_TOKENS          = 300
+MAX_WORKERS         = 8    # number of concurrent API calls
 
 # ---------------------------------------------------------------------------
 # LOGGING — only real errors get logged
@@ -187,11 +189,13 @@ Respond only with the JSON output as specified. Do not include any text outside 
 # CORE LABELLING FUNCTION
 # ---------------------------------------------------------------------------
 
-def label_single_row(job_title: str, job_description: str, skill_title: str) -> dict:
+def label_single_row(idx: int, job_title: str, job_description: str, skill_title: str) -> dict:
     """
     Calls ChatGPT to label one (job posting, skill) pair.
-    On success: returns proficiencyLevel, rationale, raw_response, error=None
-    On failure: returns all None except error which contains the error message
+    Returns dict with idx so results can be mapped back to the correct row
+    after multithreaded execution.
+    On success: proficiencyLevel, rationale, raw_response, error=None
+    On failure: all None except error which contains the error message
     """
     user_prompt = build_user_prompt(job_title, job_description, skill_title)
 
@@ -222,6 +226,7 @@ def label_single_row(job_title: str, job_description: str, skill_title: str) -> 
                 raise ValueError(f"Unexpected proficiencyLevel value: '{level}'")
 
             return {
+                "idx":              idx,
                 "proficiencyLevel": level,
                 "rationale":        parsed.get("rationale", ""),
                 "raw_response":     raw_text,
@@ -243,6 +248,7 @@ def label_single_row(job_title: str, job_description: str, skill_title: str) -> 
 
     logger.error(f"FAILED: skill='{skill_title}' | job title='{job_title}'")
     return {
+        "idx":              idx,
         "proficiencyLevel": None,
         "rationale":        None,
         "raw_response":     None,
@@ -260,12 +266,12 @@ def run_labelling_pipeline(input_csv: str, output_csv: str) -> pd.DataFrame:
     print(f"Loading data from: {input_csv}")
     df = pd.read_csv(input_csv)
 
-    required_cols = {"job_id", "jobTitle", "jobDescription", "skillTitle"}
+    required_cols = {"job_id", "jobtitle", "jobdescription", "skillTitle"}
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(f"Input CSV is missing required columns: {missing}")
 
-    print(f"{len(df)} rows loaded | {df['job_id'].nunique()} unique job IDs | {df['jobTitle'].nunique()} unique job titles | {df['skillTitle'].nunique()} unique skills\n")
+    print(f"{len(df)} rows loaded | {df['job_id'].nunique()} unique job IDs | {df['jobtitle'].nunique()} unique job titles | {df['skillTitle'].nunique()} unique skills\n")
 
     # --- Initialise the 4 output columns as None before we start ---
     df["gpt_proficiencyLevel"] = None
@@ -273,31 +279,50 @@ def run_labelling_pipeline(input_csv: str, output_csv: str) -> pd.DataFrame:
     df["gpt_raw_response"]     = None
     df["gpt_error"]            = None
 
-    # --- Main labelling loop ---
-    for i, idx in enumerate(tqdm(df.index, desc="Labelling")):
-        row = df.loc[idx]
+    # --- Build list of tasks to submit to thread pool ---
+    # Each task is a tuple of (idx, job_title, job_description, skill_title)
+    # idx is the dataframe index so we can write results back to the right row
+    tasks = [
+        (idx, str(row["jobtitle"]), str(row["jobdescription"]), str(row["skillTitle"]))
+        for idx, row in df.iterrows()
+    ]
 
-        result = label_single_row(
-            job_title=str(row["jobTitle"]),
-            job_description=str(row["jobDescription"]),
-            skill_title=str(row["skillTitle"])
-        )
+    # --- Multithreaded labelling ---
+    completed_count = 0
 
-        # Write result back into the dataframe row
-        df.at[idx, "gpt_proficiencyLevel"] = result["proficiencyLevel"]
-        df.at[idx, "gpt_rationale"]        = result["rationale"]
-        df.at[idx, "gpt_raw_response"]     = result["raw_response"]
-        df.at[idx, "gpt_error"]            = result["error"]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
 
-        # Save the whole dataframe to CSV every SAVE_EVERY rows
-        if (i + 1) % SAVE_EVERY == 0:
-            df.to_csv(output_csv, index=False)
-            print(f"  Progress saved at row {i + 1}")
+        # Submit all tasks to the thread pool
+        futures = {
+            executor.submit(label_single_row, idx, job_title, job_description, skill_title): idx
+            for idx, job_title, job_description, skill_title in tasks
+        }
+
+        # as_completed yields each future as soon as it finishes
+        # — order is not guaranteed, which is fine since we use idx to map back
+        with tqdm(total=len(futures), desc="Labelling") as pbar:
+            for future in as_completed(futures):
+                result = future.result()
+                idx    = result["idx"]
+
+                # Write result back to the correct row using idx
+                df.at[idx, "gpt_proficiencyLevel"] = result["proficiencyLevel"]
+                df.at[idx, "gpt_rationale"]        = result["rationale"]
+                df.at[idx, "gpt_raw_response"]     = result["raw_response"]
+                df.at[idx, "gpt_error"]            = result["error"]
+
+                completed_count += 1
+                pbar.update(1)
+
+                # Save every SAVE_EVERY completed rows
+                if completed_count % SAVE_EVERY == 0:
+                    df.to_csv(output_csv, index=False)
+                    print(f"  Progress saved at {completed_count} completed rows")
 
     # --- Summary before final save ---
     labelled_df = df[df["gpt_proficiencyLevel"].notna()]
     print(f"\n  Unique job IDs labelled    : {labelled_df['job_id'].nunique()}")
-    print(f"  Unique job titles labelled : {labelled_df['jobTitle'].nunique()}")
+    print(f"  Unique job titles labelled : {labelled_df['jobtitle'].nunique()}")
     print(f"  Unique skills labelled     : {labelled_df['skillTitle'].nunique()}")
 
     # --- Final save after loop completes ---
@@ -327,7 +352,7 @@ if __name__ == "__main__":
     )
 
     preview_cols = [
-        "job_id", "jobTitle", "skillTitle",
+        "job_id", "jobtitle", "skillTitle",
         "gpt_proficiencyLevel", "gpt_rationale"
     ]
     print("\nSample output:")
